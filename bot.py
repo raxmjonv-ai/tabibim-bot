@@ -163,31 +163,39 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    phone = update.message.contact.phone_number
-    course = selected_course.get(user_id, "Ko'rsatilmagan")
-    full_name = user_name.get(user_id, user.first_name)
-    age = context.user_data.get("age", "Ko'rsatilmagan")
-    username = f"@{user.username}" if user.username else "yo‘q"
+    try:
+        phone = update.message.contact.phone_number
+        course = selected_course.get(user_id, "Ko'rsatilmagan")
+        full_name = user_name.get(user_id, user.first_name)
+        age = context.user_data.get("age", "Ko'rsatilmagan")
+        username = f"@{user.username}" if user.username else "yo‘q"
 
-    admin_message = (
-        "📥 Yangi ariza!\n\n"
-        f"👤 Ism familiya: {full_name}\n"
-        f"🎂 Yoshi: {age}\n"
-        f"🆔 Username: {username}\n"
-        f"📚 Kurs: {course}\n"
-        f"📞 Telefon: {phone}"
-    )
+        admin_message = (
+            "📥 Yangi ariza!\n\n"
+            f"👤 Ism familiya: {full_name}\n"
+            f"🎂 Yoshi: {age}\n"
+            f"🆔 Username: {username}\n"
+            f"📚 Kurs: {course}\n"
+            f"📞 Telefon: {phone}"
+        )
 
-    await context.bot.send_message(
-        chat_id=LEADS_GROUP_ID,
-        text=admin_message
-    )
+        await context.bot.send_message(
+            chat_id=LEADS_GROUP_ID,
+            text=admin_message
+        )
 
-    await update.message.reply_text(
-        "Rahmat! Arizangiz qabul qilindi ✅\n"
-        "Administrator tez orada siz bilan bog'lanadi.",
-        reply_markup=main_reply_markup
-    )
+        await update.message.reply_text(
+            "Rahmat! Arizangiz qabul qilindi ✅\n"
+            "Administrator tez orada siz bilan bog'lanadi.",
+            reply_markup=main_reply_markup
+        )
+
+    except Exception as e:
+        print("HANDLE_CONTACT ERROR:", e)
+        await update.message.reply_text(
+            "Xatolik yuz berdi. Iltimos, qayta urinib ko'ring.",
+            reply_markup=main_reply_markup
+        )
 
     context.user_data.pop("age", None)
     reset_user_state(user_id)
