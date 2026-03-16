@@ -258,11 +258,119 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         waiting_for_name.discard(user_id)
         waiting_for_age.add(user_id)
 
+      async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.effective_chat.id
+    user = update.effective_user
+
+    # Кнопка "Ortga"
+    if text == "⬅️ Ortga":
+        if user_id in waiting_for_name:
+            reset_user_state(user_id)
+            await update.message.reply_text(
+                "Asosiy menyu:",
+                reply_markup=main_reply_markup
+            )
+            return
+
+        elif user_id in waiting_for_age:
+            waiting_for_age.discard(user_id)
+            waiting_for_name.add(user_id)
+
+            await update.message.reply_text(
+                "Ism va familiyangizni qayta yozing:\n\nMasalan: Vali Karimov",
+                reply_markup=ReplyKeyboardMarkup([["⬅️ Ortga"]], resize_keyboard=True)
+            )
+            return
+
+        elif user_id in waiting_for_contact:
+            waiting_for_contact.discard(user_id)
+            waiting_for_age.add(user_id)
+
+            await update.message.reply_text(
+                "Yoshingizni qayta yozing:\n\nMasalan: 21",
+                reply_markup=ReplyKeyboardMarkup([["⬅️ Ortga"]], resize_keyboard=True)
+            )
+            return
+
+        else:
+            reset_user_state(user_id)
+            await update.message.reply_text(
+                "Asosiy menyu:",
+                reply_markup=main_reply_markup
+            )
+            return
+
+    # Главное меню
+    if text == "📚 Kurslar":
+        await update.message.reply_text(
+            "Kerakli kursni tanlang:",
+            reply_markup=courses_reply_markup
+        )
+
+    elif text == "🩺 Hamshiralik":
+        selected_course[user_id] = "Hamshiralik"
+        await update.message.reply_text(
+            HAMSHIRALIK_TEXT,
+            reply_markup=course_action_reply_markup
+        )
+
+    elif text == "💆‍♀️ Massaj":
+        selected_course[user_id] = "Massaj"
+        await update.message.reply_text(
+            MASSAJ_TEXT,
+            reply_markup=course_action_reply_markup
+        )
+
+    elif text == "🩸 Hijoma":
+        selected_course[user_id] = "Hijoma"
+        await update.message.reply_text(
+            HIJOMA_TEXT,
+            reply_markup=course_action_reply_markup
+        )
+
+    elif text == "🦴 Vertebrologiya":
+        selected_course[user_id] = "Vertebrologiya"
+        await update.message.reply_text(
+            VERTEBROLOGIYA_TEXT,
+            reply_markup=course_action_reply_markup
+        )
+
+    elif text == "📝 Ro'yxatdan o'tish":
+        if user_id not in selected_course:
+            await update.message.reply_text(
+                "Avval kursni tanlang.",
+                reply_markup=courses_reply_markup
+            )
+            return
+
+        waiting_for_name.add(user_id)
+
+        await update.message.reply_text(
+            "Ism va familiyangizni yozing:\n\nMasalan: Vali Karimov",
+            reply_markup=ReplyKeyboardMarkup([["⬅️ Ortga"]], resize_keyboard=True)
+        )
+
+    # Этап имени
+    elif user_id in waiting_for_name:
+        cleaned_name = text.strip()
+
+        if len(cleaned_name) < 5 or " " not in cleaned_name:
+            await update.message.reply_text(
+                "Iltimos, ism va familiyangizni to‘liq yozing.\n\nMasalan: Malika Muslimova"
+            )
+            return
+
+        user_name[user_id] = cleaned_name
+        waiting_for_name.discard(user_id)
+        waiting_for_age.add(user_id)
+
         await update.message.reply_text(
             "Yoshingizni yozing:\n\nMasalan: 21",
             reply_markup=ReplyKeyboardMarkup([["⬅️ Ortga"]], resize_keyboard=True)
         )
 
+    # Этап возраста
     elif user_id in waiting_for_age:
         if not text.isdigit():
             await update.message.reply_text(
@@ -274,37 +382,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if age < 10 or age > 80:
             await update.message.reply_text(
-                "Iltimos, yoshingizni to‘g‘ri kiriting."
+                "Iltimos, yoshingizni to‘g‘ri kiriting.\n\nMasalan: 21"
             )
             return
 
-        course = selected_course.get(user_id, "Ko'rsatilmagan")
-        phone = user_phone.get(user_id, "Ko'rsatilmagan")
-        full_name = user_name.get(user_id, user.first_name)
-        username = f"@{user.username}" if user.username else "yo‘q"
-
-        admin_message = (
-            "📥 Yangi ariza!\n\n"
-            f"👤 Ism familiya: {full_name}\n"
-            f"🎂 Yoshi: {age}\n"
-            f"🆔 Username: {username}\n"
-            f"📚 Kurs: {course}\n"
-            f"📞 Telefon: {phone}"
-        )
-
-        await context.bot.send_message(
-            chat_id=LEADS_GROUP_ID,
-            text=admin_message
-
-        )
+        context.user_data["age"] = age
+        waiting_for_age.discard(user_id)
+        waiting_for_contact.add(user_id)
 
         await update.message.reply_text(
-            "Rahmat! Arizangiz qabul qilindi ✅\n"
-            "Administrator tez orada siz bilan bog'lanadi.",
-            reply_markup=main_reply_markup
+            "Telefon raqamingizni yuboring:",
+            reply_markup=contact_reply_markup
         )
-
-        reset_user_state(user_id)
 
     elif text == "💰 Narxlar":
         await update.message.reply_text(
@@ -325,14 +414,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_location(
             latitude=41.328819,
             longitude=69.1966517
-        )
-
-    elif text == "⬅️ Ortga":
-        reset_user_state(user_id)
-
-        await update.message.reply_text(
-            "Asosiy menyu:",
-            reply_markup=main_reply_markup
         )
 
     else:
