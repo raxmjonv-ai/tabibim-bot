@@ -177,7 +177,7 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     waiting_for_name.add(user_id)
 
     await update.message.reply_text(
-        "Ism va familiyangizni yozing:\n\nMasalan: Vali Karimov",
+        "Ism va familiyangizni yozing:\n\nMasalan: Malika Muslimova",
         reply_markup=ReplyKeyboardMarkup([["⬅️ Ortga"]], resize_keyboard=True)
     )
 
