@@ -4,7 +4,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 
 TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = 6887439064
-LEADS_GROUP_ID = -5154745000
+LEADS_GROUP_ID = -1003561971935
 
 USERS_FILE = "users.txt"
 
