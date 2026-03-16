@@ -285,7 +285,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if len(cleaned_name) < 5 or " " not in cleaned_name:
             await update.message.reply_text(
-                "Iltimos, ism va familiyangizni to‘liq yozing.\n\nMasalan: Vali Karimov"
+                "Iltimos, ism va familiyangizni to‘liq yozing.\n\nMasalan: Malika Muslimova"
             )
             return
 
