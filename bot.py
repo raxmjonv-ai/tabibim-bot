@@ -4,6 +4,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 
 TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = 6887439064
+LEADS_GROUP_ID = -5154745000
 
 USERS_FILE = "users.txt"
 
@@ -283,8 +284,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
+            chat_id=LEADS_GROUP_ID,
             text=admin_message
+
         )
 
         await update.message.reply_text(
