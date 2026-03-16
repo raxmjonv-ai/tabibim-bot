@@ -3,7 +3,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 TOKEN = os.getenv("TOKEN")
-ADMIN_CHAT_ID = -5154745000
+ADMIN_CHAT_ID = 6887439064
 
 USERS_FILE = "users.txt"
 
