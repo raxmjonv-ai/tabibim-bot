@@ -185,6 +185,14 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_chat.id
+    if text == "⬅️ Ortga":
+        reset_user_state(user_id)
+        await update.message.reply_text(
+            "Asosiy menyu:",
+            reply_markup=main_reply_markup
+        )
+        return
+
     user = update.effective_user
 
     if text == "📚 Kurslar":
