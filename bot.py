@@ -5,6 +5,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = -5154745000
 
+USERS_FILE = "users.txt"
+
 # Главное меню
 main_keyboard = [
     ["📚 Kurslar", "💰 Narxlar"],
@@ -35,7 +37,7 @@ contact_reply_markup = ReplyKeyboardMarkup(
     one_time_keyboard=True
 )
 
-# Состояния пользователя
+# Состояния
 waiting_for_contact = set()
 waiting_for_name = set()
 waiting_for_age = set()
@@ -44,7 +46,6 @@ selected_course = {}
 user_phone = {}
 user_name = {}
 
-# Тексты курсов
 HAMSHIRALIK_TEXT = """🩺 Hamshiralik kursi
 
 📚 Davomiyligi: 2 oy
@@ -103,24 +104,58 @@ VERTEBROLOGIYA_TEXT = """🦴 Vertebrologiya
 • Muolaja
 """
 
+
 def reset_user_state(user_id: int):
     waiting_for_contact.discard(user_id)
     waiting_for_name.discard(user_id)
     waiting_for_age.discard(user_id)
-
     selected_course.pop(user_id, None)
     user_phone.pop(user_id, None)
     user_name.pop(user_id, None)
 
 
+def save_user(chat_id: int):
+    existing_users = set()
+
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r", encoding="utf-8") as file:
+            existing_users = {line.strip() for line in file if line.strip()}
+
+    if str(chat_id) not in existing_users:
+        with open(USERS_FILE, "a", encoding="utf-8") as file:
+            file.write(f"{chat_id}\n")
+
+
+def get_users_count() -> int:
+    if not os.path.exists(USERS_FILE):
+        return 0
+
+    with open(USERS_FILE, "r", encoding="utf-8") as file:
+        users = {line.strip() for line in file if line.strip()}
+    return len(users)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     reset_user_state(user_id)
+    save_user(user_id)
 
     await update.message.reply_text(
         "Assalomu alaykum! Tabibim Medical Academy ga xush kelibsiz 🌿\n\n"
         "Kerakli bo'limni tanlang:",
         reply_markup=main_reply_markup
+    )
+
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("Bu buyruq faqat admin uchun.")
+        return
+
+    users_count = get_users_count()
+
+    await update.message.reply_text(
+        f"📊 Statistika\n\n👥 Bot foydalanuvchilari: {users_count} ta"
     )
 
 
@@ -201,8 +236,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif user_id in waiting_for_name:
-        user_name[user_id] = text
+        cleaned_name = text.strip()
 
+        if len(cleaned_name) < 3:
+            await update.message.reply_text(
+                "Iltimos, ism va familiyangizni to‘liq yozing."
+            )
+            return
+
+        user_name[user_id] = cleaned_name
         waiting_for_name.discard(user_id)
         waiting_for_age.add(user_id)
 
@@ -218,7 +260,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        age = text
+        age = int(text)
+
+        if age < 10 or age > 80:
+            await update.message.reply_text(
+                "Iltimos, yoshingizni to‘g‘ri kiriting."
+            )
+            return
+
         course = selected_course.get(user_id, "Ko'rsatilmagan")
         phone = user_phone.get(user_id, "Ko'rsatilmagan")
         full_name = user_name.get(user_id, user.first_name)
@@ -263,8 +312,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         await update.message.reply_location(
-            latitude=41.328582,
-            longitude=69.197010
+            latitude=41.328819,
+            longitude=69.1966517
         )
 
     elif text == "⬅️ Ortga":
@@ -285,6 +334,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("stats", stats))
 app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
