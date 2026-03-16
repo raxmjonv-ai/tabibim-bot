@@ -190,11 +190,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Asosiy menyu:",
             reply_markup=main_reply_markup
+            user = update.effective_user
+
         )
         return
 
-    user = update.effective_user
-
+    
     if text == "📚 Kurslar":
         await update.message.reply_text(
             "Kerakli kursni tanlang:",
