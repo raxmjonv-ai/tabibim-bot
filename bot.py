@@ -521,22 +521,76 @@ async def send_with_retry(method, **kwargs):
             await asyncio.sleep(float(delay) + 1)
 
 
+ANNOUNCEMENT_COURSES = {
+    "ham": ("Hamshiralik", HAMSHIRALIK_TEXT),
+    "mas": ("Massaj", MASSAJ_TEXT),
+    "hij": ("Hijoma", HIJOMA_TEXT),
+    "ver": ("Vertebrologiya", VERTEBROLOGIYA_TEXT),
+}
+
+
+def announcement_markup(course):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Ro‘yxatdan o‘tish", callback_data=f"ad:join:{course}")],
+        [InlineKeyboardButton("📚 Kurs haqida batafsil" if course != "all" else "📚 Kurslar",
+                              callback_data=f"ad:info:{course}")],
+        [InlineKeyboardButton("🏠 Asosiy menyu", callback_data="ad:home:all")],
+    ])
+
+
+async def announcement_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat = update.effective_chat
+    if chat is None or chat.type != "private" or update.effective_user is None or chat.id != update.effective_user.id:
+        await query.answer("Faqat shaxsiy chatda.", show_alert=True)
+        return
+    if is_admin(update) and context.user_data.get("broadcast"):
+        await query.answer("Сначала завершите или отмените черновик рассылки.", show_alert=True)
+        return
+    _, action, course = query.data.split(":")
+    if action != "home" and course != "all" and course not in ANNOUNCEMENT_COURSES:
+        await query.answer("Kurs topilmadi.", show_alert=True)
+        return
+    await query.answer()
+    uid = chat.id
+    # Navigation intentionally starts a fresh registration instead of mixing two courses.
+    reset_user_state(uid)
+    context.user_data.pop("age", None)
+    if action == "home":
+        await context.bot.send_message(uid, "Asosiy menyu:", reply_markup=main_reply_markup)
+    elif course == "all":
+        await context.bot.send_message(uid, "Kerakli kursni tanlang:", reply_markup=courses_reply_markup)
+    else:
+        name, description = ANNOUNCEMENT_COURSES[course]
+        selected_course[uid] = name
+        if action == "join":
+            waiting_for_name.add(uid)
+            await context.bot.send_message(uid, f"📚 Kurs: {name}\n\nIsm va familiyangizni yozing:\n\nMasalan: Malika Muslimova",
+                                           reply_markup=ReplyKeyboardMarkup([["⬅️ Ortga"]], resize_keyboard=True))
+        else:
+            await context.bot.send_message(uid, description, reply_markup=course_action_reply_markup)
+
+
 async def send_announcement(bot, chat_id, draft):
     text = draft["text"]
     entities = draft["entities"]
+    markup = announcement_markup(draft["course"])
     if utf16_length(text) <= 1024:
         await send_with_retry(bot.send_photo, chat_id=chat_id, photo=draft["photo"],
-                              caption=text, caption_entities=entities)
+                              caption=text, caption_entities=entities, reply_markup=markup)
     else:
         await send_with_retry(bot.send_photo, chat_id=chat_id, photo=draft["photo"])
         await asyncio.sleep(1.1)
-        await send_with_retry(bot.send_message, chat_id=chat_id, text=text, entities=entities)
+        await send_with_retry(bot.send_message, chat_id=chat_id, text=text, entities=entities, reply_markup=markup)
 
 
 async def broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     draft = context.user_data["broadcast"]
     if draft["stage"] == "photo":
         await update.message.reply_text("Сначала отправьте фотографию. Отмена: /cancelbroadcast")
+        return
+    if draft["stage"] == "course":
+        await update.message.reply_text("Выберите курс кнопками в предыдущем сообщении. Отмена: /cancelbroadcast")
         return
     if draft["stage"] == "confirm":
         await update.message.reply_text("Подтвердите или отмените рассылку кнопками под просмотром.")
@@ -547,19 +601,45 @@ async def broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     draft["text"] = text
     draft["entities"] = tuple(update.message.entities or ())
+    draft["stage"] = "course"
+    nonce = draft["nonce"]
+    await update.message.reply_text("К какому курсу относится объявление?", reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("🩺 Hamshiralik", callback_data=f"bcourse:ham:{nonce}"),
+         InlineKeyboardButton("💆‍♀️ Massaj", callback_data=f"bcourse:mas:{nonce}")],
+        [InlineKeyboardButton("🩸 Hijoma", callback_data=f"bcourse:hij:{nonce}"),
+         InlineKeyboardButton("🦴 Vertebrologiya", callback_data=f"bcourse:ver:{nonce}")],
+        [InlineKeyboardButton("📢 Общее объявление", callback_data=f"bcourse:all:{nonce}")],
+    ]))
+
+
+async def broadcast_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(update):
+        await query.answer("Доступ запрещён", show_alert=True)
+        return
+    draft = context.user_data.get("broadcast")
+    _, course, nonce = query.data.split(":")
+    if not draft or draft["stage"] != "course" or draft["nonce"] != nonce:
+        await query.answer("Этот черновик уже закрыт.", show_alert=True)
+        return
+    if course != "all" and course not in ANNOUNCEMENT_COURSES:
+        await query.answer("Курс не найден.", show_alert=True)
+        return
+    draft["course"] = course
+    await query.answer()
     # Preview is delivered using exactly the same method as the real announcement.
-    await update.message.reply_text("📋 Предварительный просмотр:")
+    await context.bot.send_message(ADMIN_CHAT_ID, "📋 Предварительный просмотр:")
     try:
         await send_announcement(context.bot, ADMIN_CHAT_ID, draft)
     except TelegramError as exc:
         print("Broadcast preview error:", type(exc).__name__)
-        await update.message.reply_text("Не удалось показать объявление. Попробуйте другой текст или /sendall.")
+        await context.bot.send_message(ADMIN_CHAT_ID, "Не удалось показать объявление. Выберите курс повторно или начните заново: /sendall.")
         return
     ids = recipients()
     draft["recipients"] = ids
     draft["stage"] = "confirm"
     nonce = draft["nonce"]
-    await update.message.reply_text(
+    await context.bot.send_message(ADMIN_CHAT_ID,
         f"Отправить объявление {len(ids)} получателям?\nДо подтверждения рассылка не начнётся.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Отправить", callback_data=f"bc:yes:{nonce}"),
@@ -683,6 +763,8 @@ app.add_handler(CommandHandler("restoreusers", restoreusers))
 app.add_handler(CommandHandler("stopads", stopads))
 app.add_handler(CommandHandler("startads", startads))
 app.add_handler(CallbackQueryHandler(broadcast_confirm, pattern=r"^bc:(yes|no|test):[0-9a-f]{16}$"))
+app.add_handler(CallbackQueryHandler(broadcast_course, pattern=r"^bcourse:(ham|mas|hij|ver|all):[0-9a-f]{16}$"))
+app.add_handler(CallbackQueryHandler(announcement_action, pattern=r"^ad:(join|info|home):(ham|mas|hij|ver|all)$"))
 app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, broadcast_photo))
 app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
