@@ -1,12 +1,26 @@
 import os
+import asyncio
+import secrets
+from telegram.error import TelegramError, RetryAfter
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, TypeHandler, ApplicationHandlerStop, ContextTypes, filters
 
 TOKEN = os.getenv("TOKEN")
 ADMIN_CHAT_ID = 6887439064
 LEADS_GROUP_ID = -1003561971935
 
-USERS_FILE = "users.txt"
+# Persistent user storage: never silently fall back to ephemeral Railway disk.
+from pathlib import Path
+
+volume_mount = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+if os.getenv("RAILWAY_PROJECT_ID") and not volume_mount:
+    raise RuntimeError("Attach a Railway Volume at /data before deploying this bot.")
+DATA_DIR = Path(volume_mount) if volume_mount else Path(os.getenv("LOCAL_DATA_DIR", "data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+if os.getenv("RAILWAY_PROJECT_ID") and not os.path.ismount(DATA_DIR):
+    raise RuntimeError("Railway volume is not mounted; refusing to use temporary disk.")
+USERS_FILE = str(DATA_DIR / "users.txt")
+OPTOUT_FILE = str(DATA_DIR / "users_optout.txt")
 
 TELEGRAM_URL = "https://t.me/tabibim_academy"
 INSTAGRAM_URL = "https://www.instagram.com/tabibim_academy/"
@@ -115,45 +129,70 @@ def reset_user_state(user_id: int):
     selected_course.pop(user_id, None)
     user_name.pop(user_id, None)
 
+def write_ids(path, ids):
+    # Single bot replica; atomic replacement prevents a partially written list.
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(f"{uid}\n" for uid in sorted(ids))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def save_user(chat_id: int):
-    existing_users = set()
+    if not 0 < chat_id < 2**52:
+        return
+    existing = read_ids(USERS_FILE)
+    if chat_id not in existing:
+        write_ids(USERS_FILE, existing | {chat_id})
 
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r", encoding="utf-8") as file:
-            existing_users = {line.strip() for line in file if line.strip()}
-
-    if str(chat_id) not in existing_users:
-        with open(USERS_FILE, "a", encoding="utf-8") as file:
-            file.write(f"{chat_id}\n")
 
 def get_users_count() -> int:
-    if not os.path.exists(USERS_FILE):
-        return 0
+    return len(read_ids(USERS_FILE))
 
-    with open(USERS_FILE, "r", encoding="utf-8") as file:
-        users = {line.strip() for line in file if line.strip()}
-    return len(users)
+
+async def track_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    # Count incoming private messages and button presses, not group members.
+    if (chat is None or chat.type != "private" or user is None or user.is_bot
+            or chat.id != user.id or not (update.message or update.callback_query)):
+        return
+    try:
+        save_user(chat.id)
+    except OSError as exc:
+        print("Persistent user storage error:", type(exc).__name__, flush=True)
+        if update.effective_message:
+            await update.effective_message.reply_text("Vaqtinchalik texnik xatolik. Iltimos, keyinroq urinib ko‘ring.")
+        raise ApplicationHandlerStop
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
     reset_user_state(user_id)
-    save_user(user_id)
+    if is_admin(update):
+        context.user_data.pop("broadcast", None)
 
     await update.message.reply_text(
         "Assalomu alaykum! Tabibim Medical Academy ga xush kelibsiz 🌿\n\n"
-        "Kerakli bo'limni tanlang:",
+        "Kerakli bo'limni tanlang:\n\nYangiliklar xabarlarini o‘chirish: /stopads",
         reply_markup=main_reply_markup
     )
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_CHAT_ID:
+    if not is_admin(update):
         await update.message.reply_text("Bu buyruq faqat admin uchun.")
         return
 
     users_count = get_users_count()
 
     await update.message.reply_text(
-        f"📊 Statistika\n\n👥 Bot foydalanuvchilari: {users_count} ta"
+        f"📊 Statistika\n\n👥 Bot foydalanuvchilari: {users_count} ta\n📢 Reklama oluvchilar: {len(recipients())} ta"
     )
 
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -207,6 +246,10 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_chat.id
+
+    if is_admin(update) and context.user_data.get("broadcast"):
+        await broadcast_text(update, context)
+        return
 
     if text == "⬅️ Ortga":
         if user_id in waiting_for_name:
@@ -379,10 +422,268 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_reply_markup
         )
 
+# Рассылка (только личный чат администратора)
+def is_admin(update: Update) -> bool:
+    return (update.effective_chat is not None and update.effective_chat.type == "private"
+            and update.effective_user is not None and update.effective_user.id == ADMIN_CHAT_ID
+            and update.effective_chat.id == ADMIN_CHAT_ID)
+
+
+def read_ids(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return {int(line.strip()) for line in f if line.strip().isascii()
+                    and line.strip().isdigit() and 0 < int(line.strip()) < 2**52}
+    except FileNotFoundError:
+        return set()
+
+
+def recipients():
+    return sorted(read_ids(USERS_FILE) - read_ids(OPTOUT_FILE))
+
+
+async def stopads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+    uid = update.effective_chat.id
+    ids = read_ids(OPTOUT_FILE)
+    if uid not in ids:
+        write_ids(OPTOUT_FILE, ids | {uid})
+    await update.message.reply_text("Reklama xabarlari o‘chirildi. Qayta yoqish: /startads")
+
+
+async def startads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        return
+    uid = update.effective_chat.id
+    ids = read_ids(OPTOUT_FILE) - {uid}
+    write_ids(OPTOUT_FILE, ids)
+    save_user(uid)
+    await update.message.reply_text("Reklama xabarlari yoqildi. Bekor qilish: /stopads")
+
+
+async def sendall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        await update.message.reply_text("Bu buyruq faqat admin uchun.")
+        return
+    if context.bot_data.get("broadcast_running"):
+        await update.message.reply_text("Рассылка уже выполняется.")
+        return
+    context.user_data["broadcast"] = {"stage": "photo", "nonce": secrets.token_hex(8)}
+    await update.message.reply_text(
+        f"📢 Создание рассылки\nПолучателей сейчас: {len(recipients())}\n\n"
+        "Отправьте одну фотографию (как фото, не как файл). Затем отправьте текст отдельным сообщением.\n"
+        "Для отмены: /cancelbroadcast")
+
+
+async def cancelbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if context.bot_data.get("broadcast_running"):
+        await update.message.reply_text("Рассылка уже началась. Отправленные сообщения отменить нельзя.")
+        return
+    context.user_data.pop("broadcast", None)
+    await update.message.reply_text("❌ Черновик рассылки отменён.")
+
+
+async def broadcast_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    draft = context.user_data.get("broadcast")
+    if not draft:
+        return
+    if draft["stage"] != "photo":
+        await update.message.reply_text("Фото уже выбрано. Чтобы начать заново: /sendall")
+        return
+    if update.message.media_group_id:
+        await update.message.reply_text("Отправьте одну фотографию, не альбом.")
+        return
+    draft["photo"] = update.message.photo[-1].file_id
+    draft["stage"] = "text"
+    await update.message.reply_text("✅ Фотография получена! Теперь отправьте текст отдельным сообщением.")
+
+
+def utf16_length(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+async def send_with_retry(method, **kwargs):
+    # Retry only explicit flood limits, not ambiguous network failures.
+    for attempt in range(4):
+        try:
+            return await method(**kwargs)
+        except RetryAfter as exc:
+            if attempt == 3:
+                raise
+            delay = exc.retry_after
+            if hasattr(delay, "total_seconds"):
+                delay = delay.total_seconds()
+            await asyncio.sleep(float(delay) + 1)
+
+
+async def send_announcement(bot, chat_id, draft):
+    text = draft["text"]
+    entities = draft["entities"]
+    if utf16_length(text) <= 1024:
+        await send_with_retry(bot.send_photo, chat_id=chat_id, photo=draft["photo"],
+                              caption=text, caption_entities=entities)
+    else:
+        await send_with_retry(bot.send_photo, chat_id=chat_id, photo=draft["photo"])
+        await asyncio.sleep(1.1)
+        await send_with_retry(bot.send_message, chat_id=chat_id, text=text, entities=entities)
+
+
+async def broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    draft = context.user_data["broadcast"]
+    if draft["stage"] == "photo":
+        await update.message.reply_text("Сначала отправьте фотографию. Отмена: /cancelbroadcast")
+        return
+    if draft["stage"] == "confirm":
+        await update.message.reply_text("Подтвердите или отмените рассылку кнопками под просмотром.")
+        return
+    text = update.message.text
+    if not text.strip() or utf16_length(text) > 4096:
+        await update.message.reply_text("Введите непустой текст до 4096 символов (эмодзи могут занимать два).")
+        return
+    draft["text"] = text
+    draft["entities"] = tuple(update.message.entities or ())
+    # Preview is delivered using exactly the same method as the real announcement.
+    await update.message.reply_text("📋 Предварительный просмотр:")
+    try:
+        await send_announcement(context.bot, ADMIN_CHAT_ID, draft)
+    except TelegramError as exc:
+        print("Broadcast preview error:", type(exc).__name__)
+        await update.message.reply_text("Не удалось показать объявление. Попробуйте другой текст или /sendall.")
+        return
+    ids = recipients()
+    draft["recipients"] = ids
+    draft["stage"] = "confirm"
+    nonce = draft["nonce"]
+    await update.message.reply_text(
+        f"Отправить объявление {len(ids)} получателям?\nДо подтверждения рассылка не начнётся.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Отправить", callback_data=f"bc:yes:{nonce}"),
+             InlineKeyboardButton("❌ Отменить", callback_data=f"bc:no:{nonce}")],
+            [InlineKeyboardButton("🧪 Только тест (мне)", callback_data=f"bc:test:{nonce}")]
+        ]))
+
+
+async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(update):
+        await query.answer("Доступ запрещён", show_alert=True)
+        return
+    draft = context.user_data.get("broadcast")
+    _, action, nonce = query.data.split(":")
+    if not draft or draft["stage"] != "confirm" or draft["nonce"] != nonce:
+        await query.answer("Этот черновик уже закрыт.", show_alert=True)
+        return
+    if context.bot_data.get("broadcast_running"):
+        await query.answer("Рассылка уже выполняется.", show_alert=True)
+        return
+    if action == "test":
+        await query.answer("Тест только администратору")
+        try:
+            await send_announcement(context.bot, ADMIN_CHAT_ID, draft)
+        except TelegramError:
+            await context.bot.send_message(ADMIN_CHAT_ID, "Ошибка тестовой отправки.")
+        return
+    if action == "no":
+        context.user_data.pop("broadcast", None)
+        await query.answer()
+        await query.edit_message_text("❌ Рассылка отменена.")
+        return
+    if not draft["recipients"]:
+        await query.answer("База получателей пуста.", show_alert=True)
+        return
+    # Consume confirmation before any network await: a double click cannot start twice.
+    context.user_data.pop("broadcast", None)
+    context.bot_data["broadcast_running"] = True
+    context.application.create_task(run_broadcast(context.bot, context.bot_data, draft), update=update)
+    await query.answer("Рассылка запущена")
+    await query.edit_message_text(f"🚀 Рассылка запущена: {len(draft['recipients'])} получателей.")
+
+
+async def run_broadcast(bot, bot_data, draft):
+    success = failed = skipped = 0
+    try:
+        for uid in draft["recipients"]:
+            if uid in read_ids(OPTOUT_FILE):
+                skipped += 1
+                continue
+            try:
+                await send_announcement(bot, uid, draft)
+                success += 1
+            except TelegramError as exc:
+                failed += 1
+                print("Broadcast delivery error:", type(exc).__name__)
+            await asyncio.sleep(0.15)
+    finally:
+        bot_data["broadcast_running"] = False
+        remaining = len(draft["recipients"]) - success - failed - skipped
+        await bot.send_message(ADMIN_CHAT_ID,
+            f"📊 Отчёт о рассылке\n\n✅ Отправлено полностью: {success}\n"
+            f"⚠️ Ошибка / возможна частичная доставка: {failed}\n"
+            f"🔕 Отписались: {skipped}\n⏳ Не обработано: {remaining}\n"
+            f"Всего в подтверждённом списке: {len(draft['recipients'])}")
+
+
+async def usersbackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not os.path.isfile(USERS_FILE):
+        await update.message.reply_text("Файл пользователей пока отсутствует.")
+        return
+    with open(USERS_FILE, "rb") as f:
+        await update.message.reply_document(document=f, filename="users.txt")
+    if os.path.isfile(OPTOUT_FILE):
+        with open(OPTOUT_FILE, "rb") as f:
+            await update.message.reply_document(document=f, filename="users_optout.txt")
+
+
+async def restoreusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    original = update.message.reply_to_message
+    doc = original.document if original else None
+    if not doc or doc.file_name not in {"users.txt", "users_optout.txt"} or (doc.file_size or 0) > 5_000_000:
+        await update.message.reply_text("Ответьте командой /restoreusers на файл users.txt или users_optout.txt (до 5 МБ).")
+        return
+    try:
+        file = await doc.get_file()
+        data = (await file.download_as_bytearray()).decode("utf-8-sig")
+        lines = [line.strip() for line in data.splitlines() if line.strip()]
+        if any(not line.isascii() or not line.isdigit() or not 0 < int(line) < 2**52 for line in lines):
+            raise ValueError("Invalid user ID")
+        path = OPTOUT_FILE if doc.file_name == "users_optout.txt" else USERS_FILE
+        existing = read_ids(path)
+        merged = existing | {int(line) for line in lines}
+        write_ids(path, merged)
+        await update.message.reply_text(f"✅ Добавлено: {len(merged - existing)}. Всего в файле: {len(merged)}.")
+    except (ValueError, TelegramError, OSError):
+        await update.message.reply_text("Не удалось импортировать файл. Исходный список не заменён, если запись не завершилась.")
+
+
+for path in (USERS_FILE, OPTOUT_FILE):
+    if not os.path.exists(path):
+        write_ids(path, set())
+    else:
+        with open(path, "a", encoding="utf-8"):
+            pass
+
 app = ApplicationBuilder().token(TOKEN).build()
 
+app.add_handler(TypeHandler(Update, track_user), group=-1)
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("stats", stats))
+app.add_handler(CommandHandler("sendall", sendall))
+app.add_handler(CommandHandler("cancelbroadcast", cancelbroadcast))
+app.add_handler(CommandHandler("usersbackup", usersbackup))
+app.add_handler(CommandHandler("restoreusers", restoreusers))
+app.add_handler(CommandHandler("stopads", stopads))
+app.add_handler(CommandHandler("startads", startads))
+app.add_handler(CallbackQueryHandler(broadcast_confirm, pattern=r"^bc:(yes|no|test):[0-9a-f]{16}$"))
+app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, broadcast_photo))
 app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
