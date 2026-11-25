@@ -1,5 +1,5 @@
 import os
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 TOKEN = os.getenv("TOKEN")
@@ -8,10 +8,14 @@ LEADS_GROUP_ID = -1003561971935
 
 USERS_FILE = "users.txt"
 
+TELEGRAM_URL = "https://t.me/tabibim_academy"
+INSTAGRAM_URL = "https://www.instagram.com/tabibim_academy/"
+
 # Главное меню
 main_keyboard = [
     ["📚 Kurslar", "💰 Narxlar"],
-    ["📍 Manzil", "📝 Ro'yxatdan o'tish"]
+    ["📍 Manzil", "📝 Ro'yxatdan o'tish"],
+    ["📢 Telegram kanal", "📸 Instagram"]
 ]
 main_reply_markup = ReplyKeyboardMarkup(main_keyboard, resize_keyboard=True)
 
@@ -271,6 +275,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             VERTEBROLOGIYA_TEXT,
             reply_markup=course_action_reply_markup
+        )
+
+    elif text == "📢 Telegram kanal":
+        await update.message.reply_text(
+            "📢 Rasmiy Telegram kanalimizga obuna bo‘ling!\n\n"
+            "Kurslarimiz, yangiliklar va e’lonlar bilan tanishing.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Telegram kanalga o‘tish ↗", url=TELEGRAM_URL)]
+            ])
+        )
+
+    elif text == "📸 Instagram":
+        await update.message.reply_text(
+            "📸 Instagram sahifamizga xush kelibsiz!\n\n"
+            "Dars jarayonlari, bitiruvchilarimiz va yangiliklarni kuzatib boring.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Instagram sahifasiga o‘tish ↗", url=INSTAGRAM_URL)]
+            ])
         )
 
     elif text == "📝 Ro'yxatdan o'tish":
