@@ -473,6 +473,15 @@ async def startads(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deliver_active_ads(context.bot, uid)
 
 
+BROADCAST_FORMATS = {
+    "pt": ("photo", True, "🖼 Фото + текст"),
+    "vt": ("video", True, "🎬 Видео + текст"),
+    "p": ("photo", False, "📷 Только фото"),
+    "v": ("video", False, "🎥 Только видео"),
+    "t": ("text", True, "📝 Только текст"),
+}
+
+
 async def sendall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("Bu buyruq faqat admin uchun.")
@@ -480,11 +489,48 @@ async def sendall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.bot_data.get("broadcast_running"):
         await update.message.reply_text("Рассылка уже выполняется.")
         return
-    context.user_data["broadcast"] = {"stage": "photo", "nonce": secrets.token_hex(8)}
+    nonce = secrets.token_hex(8)
+    context.user_data["broadcast"] = {"stage": "format", "nonce": nonce}
     await update.message.reply_text(
-        f"📢 Создание рассылки\nПолучателей сейчас: {len(recipients())}\n\n"
-        "Отправьте одну фотографию (как фото, не как файл). Затем отправьте текст отдельным сообщением.\n"
-        "Для отмены: /cancelbroadcast")
+        f"📢 Создание рассылки\nПолучателей сейчас: {len(recipients())}\n\nВыберите формат:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(label, callback_data=f"bformat:{key}:{nonce}")]
+            for key, (_, _, label) in BROADCAST_FORMATS.items()
+        ] + [[InlineKeyboardButton("❌ Отменить", callback_data=f"bformat:cancel:{nonce}")]]))
+
+
+async def broadcast_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(update):
+        await query.answer("Доступ запрещён", show_alert=True)
+        return
+    _, choice, nonce = query.data.split(":")
+    draft = context.user_data.get("broadcast")
+    if not draft or draft["stage"] != "format" or draft["nonce"] != nonce:
+        await query.answer("Этот выбор уже закрыт.", show_alert=True)
+        return
+    if choice == "cancel":
+        context.user_data.pop("broadcast", None)
+        await query.answer()
+        await query.edit_message_text("❌ Черновик рассылки отменён.")
+        return
+    if choice not in BROADCAST_FORMATS:
+        await query.answer("Неизвестный формат.", show_alert=True)
+        return
+    media_type, with_text, label = BROADCAST_FORMATS[choice]
+    draft.update(media_type=media_type, with_text=with_text, photo="", text="", entities=(),
+                 stage="text" if media_type == "text" else "media")
+    await query.answer()
+    await query.edit_message_text(f"Формат: {label}")
+    if media_type == "text":
+        prompt = "Отправьте текст объявления."
+    elif media_type == "photo":
+        prompt = "Отправьте одну фотографию как фото, не как файл."
+    else:
+        prompt = "Отправьте одно видео как обычное видео, не как файл или кружок."
+    if media_type != "text" and with_text:
+        prompt += " Затем отправьте текст отдельным сообщением."
+    await context.bot.send_message(ADMIN_CHAT_ID, prompt + "\nОтмена: /cancelbroadcast")
 
 
 async def cancelbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -497,21 +543,37 @@ async def cancelbroadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Черновик рассылки отменён.")
 
 
-async def broadcast_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def broadcast_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
     draft = context.user_data.get("broadcast")
     if not draft:
         return
-    if draft["stage"] != "photo":
-        await update.message.reply_text("Фото уже выбрано. Чтобы начать заново: /sendall")
+    if draft["stage"] != "media":
+        await update.message.reply_text("Сейчас загрузка медиа не ожидается. Следуйте шагам черновика или начните заново: /sendall")
         return
-    if update.message.media_group_id:
-        await update.message.reply_text("Отправьте одну фотографию, не альбом.")
+    msg = update.message
+    if msg.media_group_id:
+        await msg.reply_text("Отправьте один файл, не альбом.")
         return
-    draft["photo"] = update.message.photo[-1].file_id
-    draft["stage"] = "text"
-    await update.message.reply_text("✅ Фотография получена! Теперь отправьте текст отдельным сообщением.")
+    kind = draft["media_type"]
+    if kind == "photo" and msg.photo:
+        file_id = msg.photo[-1].file_id
+        label = "Фотография получена"
+    elif kind == "video" and msg.video:
+        file_id = msg.video.file_id
+        label = "Видео получено"
+    else:
+        await msg.reply_text("Нужна фотография." if kind == "photo" else "Нужно обычное видео, не документ и не кружок.")
+        return
+    # Keep the legacy photo column/key as the media file ID for existing ads.
+    draft["photo"] = file_id
+    if draft["with_text"]:
+        draft["stage"] = "text"
+        await msg.reply_text(f"✅ {label}! Теперь отправьте текст отдельным сообщением. Подпись исходного файла не используется.")
+    else:
+        await msg.reply_text(f"✅ {label}! Текст не нужен; подпись исходного файла не используется.")
+        await ask_broadcast_course(msg, draft)
 
 
 def utf16_length(text):
@@ -586,11 +648,25 @@ async def send_announcement(bot, chat_id, draft):
     text = draft["text"]
     entities = draft["entities"]
     markup = announcement_markup(draft["course"])
-    if utf16_length(text) <= 1024:
-        await send_with_retry(bot.send_photo, chat_id=chat_id, photo=draft["photo"],
-                              caption=text, caption_entities=entities, reply_markup=markup)
+    kind = draft.get("media_type", "photo")  # old announcements remain photos
+    if kind == "text":
+        await send_with_retry(bot.send_message, chat_id=chat_id, text=text,
+                              entities=entities, reply_markup=markup)
+        return
+    if kind == "photo":
+        method = bot.send_photo
+    elif kind == "video":
+        method = bot.send_video
     else:
-        await send_with_retry(bot.send_photo, chat_id=chat_id, photo=draft["photo"])
+        raise ValueError("Unknown announcement media type")
+    media = {kind: draft["photo"]}
+    if utf16_length(text) <= 1024:
+        kwargs = dict(chat_id=chat_id, reply_markup=markup, **media)
+        if text:
+            kwargs.update(caption=text, caption_entities=entities)
+        await send_with_retry(method, **kwargs)
+    else:
+        await send_with_retry(method, chat_id=chat_id, **media)
         await asyncio.sleep(1.1)
         await send_with_retry(bot.send_message, chat_id=chat_id, text=text, entities=entities, reply_markup=markup)
 
@@ -613,13 +689,17 @@ def init_ads():
         CREATE TABLE IF NOT EXISTS ads (
             id TEXT PRIMARY KEY, photo TEXT NOT NULL, text TEXT NOT NULL,
             entities TEXT NOT NULL, course TEXT NOT NULL, expires INTEGER NOT NULL,
-            closed INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL
+            closed INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL,
+            media_type TEXT NOT NULL DEFAULT 'photo'
         );
         CREATE TABLE IF NOT EXISTS ad_delivery (
             ad_id TEXT NOT NULL, uid INTEGER NOT NULL, status TEXT NOT NULL,
             PRIMARY KEY(ad_id, uid)
         );
         """)
+        # In-place additive migration: preserves all existing ads and delivery history.
+        if "media_type" not in {row["name"] for row in db.execute("PRAGMA table_info(ads)")}:
+            db.execute("ALTER TABLE ads ADD COLUMN media_type TEXT NOT NULL DEFAULT 'photo'")
 
 
 def now_ts():
@@ -642,10 +722,10 @@ def expiry_label(expires):
 
 def publish_ad(draft):
     with ads_db() as db:
-        db.execute("INSERT INTO ads(id,photo,text,entities,course,expires,created) VALUES(?,?,?,?,?,?,?)",
+        db.execute("INSERT INTO ads(id,photo,text,entities,course,expires,created,media_type) VALUES(?,?,?,?,?,?,?,?)",
                    (draft["nonce"], draft["photo"], draft["text"],
                     json.dumps([e.to_dict() for e in draft["entities"]], ensure_ascii=False),
-                    draft["course"], draft["expires"], now_ts()))
+                    draft["course"], draft["expires"], now_ts(), draft.get("media_type", "photo")))
 
 
 def list_active_ads():
@@ -711,7 +791,8 @@ async def activeads(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📢 Активных объявлений: {len(ads)}. Закрытие прекращает новые отправки, но не удаляет уже отправленные сообщения.")
     for ad in ads:
         title = ANNOUNCEMENT_COURSES.get(ad["course"], ("Общее объявление",))[0]
-        await update.message.reply_text(f"{title} — до {expiry_label(ad['expires'])} включительно\n\n{ad['text'][:350]}",
+        kind = {"photo": "🖼 Фото", "video": "🎬 Видео", "text": "📝 Текст"}.get(ad["media_type"], "Объявление")
+        await update.message.reply_text(f"{kind} · {title} — до {expiry_label(ad['expires'])} включительно\n\n{ad['text'][:350] or 'Без текста'}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Закрыть объявление", callback_data=f"adclose:ask:{ad['id']}")]]))
 
 
@@ -736,8 +817,11 @@ async def closead_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     draft = context.user_data["broadcast"]
-    if draft["stage"] == "photo":
-        await update.message.reply_text("Сначала отправьте фотографию. Отмена: /cancelbroadcast")
+    if draft["stage"] == "format":
+        await update.message.reply_text("Выберите формат кнопками. Отмена: /cancelbroadcast")
+        return
+    if draft["stage"] == "media":
+        await update.message.reply_text("Сначала отправьте фотографию или видео выбранного формата. Отмена: /cancelbroadcast")
         return
     if draft["stage"] == "course":
         await update.message.reply_text("Выберите курс кнопками в предыдущем сообщении. Отмена: /cancelbroadcast")
@@ -753,15 +837,21 @@ async def broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if draft["stage"] == "confirm":
         await update.message.reply_text("Подтвердите или отмените рассылку кнопками под просмотром.")
         return
+    if draft["stage"] != "text":
+        return
     text = update.message.text
     if not text.strip() or utf16_length(text) > 4096:
         await update.message.reply_text("Введите непустой текст до 4096 символов (эмодзи могут занимать два).")
         return
     draft["text"] = text
     draft["entities"] = tuple(update.message.entities or ())
+    await ask_broadcast_course(update.message, draft)
+
+
+async def ask_broadcast_course(message, draft):
     draft["stage"] = "course"
     nonce = draft["nonce"]
-    await update.message.reply_text("К какому курсу относится объявление?", reply_markup=InlineKeyboardMarkup([
+    await message.reply_text("К какому курсу относится объявление?", reply_markup=InlineKeyboardMarkup([
         [InlineKeyboardButton("🩺 Hamshiralik", callback_data=f"bcourse:ham:{nonce}"),
          InlineKeyboardButton("💆‍♀️ Massaj", callback_data=f"bcourse:mas:{nonce}")],
         [InlineKeyboardButton("🩸 Hijoma", callback_data=f"bcourse:hij:{nonce}"),
@@ -947,9 +1037,10 @@ app.add_handler(CommandHandler("restoreusers", restoreusers))
 app.add_handler(CommandHandler("stopads", stopads))
 app.add_handler(CommandHandler("startads", startads))
 app.add_handler(CallbackQueryHandler(broadcast_confirm, pattern=r"^bc:(yes|no|test):[0-9a-f]{16}$"))
+app.add_handler(CallbackQueryHandler(broadcast_format, pattern=r"^bformat:(pt|vt|p|v|t|cancel):[0-9a-f]{16}$"))
 app.add_handler(CallbackQueryHandler(broadcast_course, pattern=r"^bcourse:(ham|mas|hij|ver|all):[0-9a-f]{16}$"))
 app.add_handler(CallbackQueryHandler(announcement_action, pattern=r"^ad:(join|info|home):(ham|mas|hij|ver|all)$"))
-app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, broadcast_photo))
+app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VIDEO_NOTE | filters.ANIMATION) & filters.ChatType.PRIVATE, broadcast_media))
 app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
