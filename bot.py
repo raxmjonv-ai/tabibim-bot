@@ -1,8 +1,12 @@
 import os
 import asyncio
 import secrets
+import json
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from telegram.error import TelegramError, RetryAfter
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import MessageEntity, Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, TypeHandler, ApplicationHandlerStop, ContextTypes, filters
 
 TOKEN = os.getenv("TOKEN")
@@ -21,6 +25,8 @@ if os.getenv("RAILWAY_PROJECT_ID") and not os.path.ismount(DATA_DIR):
     raise RuntimeError("Railway volume is not mounted; refusing to use temporary disk.")
 USERS_FILE = str(DATA_DIR / "users.txt")
 OPTOUT_FILE = str(DATA_DIR / "users_optout.txt")
+ADS_DB = DATA_DIR / "announcements.sqlite3"
+TASHKENT = timezone(timedelta(hours=5))
 
 TELEGRAM_URL = "https://t.me/tabibim_academy"
 INSTAGRAM_URL = "https://www.instagram.com/tabibim_academy/"
@@ -183,6 +189,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Kerakli bo'limni tanlang:\n\nYangiliklar xabarlarini o‘chirish: /stopads",
         reply_markup=main_reply_markup
     )
+
+    if update.effective_chat.type == "private" and not is_admin(update):
+        await deliver_active_ads(context.bot, user_id)
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -460,6 +469,8 @@ async def startads(update: Update, context: ContextTypes.DEFAULT_TYPE):
     write_ids(OPTOUT_FILE, ids)
     save_user(uid)
     await update.message.reply_text("Reklama xabarlari yoqildi. Bekor qilish: /stopads")
+    if not is_admin(update):
+        await deliver_active_ads(context.bot, uid)
 
 
 async def sendall(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -584,6 +595,145 @@ async def send_announcement(bot, chat_id, draft):
         await send_with_retry(bot.send_message, chat_id=chat_id, text=text, entities=entities, reply_markup=markup)
 
 
+# Persistent announcement catalogue and delivery ledger. No change to users.txt.
+@contextmanager
+def ads_db():
+    conn = sqlite3.connect(ADS_DB, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def init_ads():
+    with ads_db() as db:
+        db.executescript("""
+        CREATE TABLE IF NOT EXISTS ads (
+            id TEXT PRIMARY KEY, photo TEXT NOT NULL, text TEXT NOT NULL,
+            entities TEXT NOT NULL, course TEXT NOT NULL, expires INTEGER NOT NULL,
+            closed INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ad_delivery (
+            ad_id TEXT NOT NULL, uid INTEGER NOT NULL, status TEXT NOT NULL,
+            PRIMARY KEY(ad_id, uid)
+        );
+        """)
+
+
+def now_ts():
+    return int(datetime.now(TASHKENT).timestamp())
+
+
+def parse_expiry(value):
+    value = value.strip()
+    if value == "0":
+        return 0
+    day = datetime.strptime(value, "%d.%m.%Y").replace(tzinfo=TASHKENT)
+    if day.date() < datetime.now(TASHKENT).date():
+        raise ValueError("past date")
+    return int((day + timedelta(days=1)).timestamp())
+
+
+def expiry_label(expires):
+    return (datetime.fromtimestamp(expires, TASHKENT) - timedelta(seconds=1)).strftime("%d.%m.%Y") if expires else "только одна рассылка"
+
+
+def publish_ad(draft):
+    with ads_db() as db:
+        db.execute("INSERT INTO ads(id,photo,text,entities,course,expires,created) VALUES(?,?,?,?,?,?,?)",
+                   (draft["nonce"], draft["photo"], draft["text"],
+                    json.dumps([e.to_dict() for e in draft["entities"]], ensure_ascii=False),
+                    draft["course"], draft["expires"], now_ts()))
+
+
+def list_active_ads():
+    with ads_db() as db:
+        return db.execute("SELECT * FROM ads WHERE closed=0 AND expires>? ORDER BY created,id", (now_ts(),)).fetchall()
+
+
+def close_ad(ad_id):
+    with ads_db() as db:
+        return db.execute("UPDATE ads SET closed=1 WHERE id=? AND closed=0 AND expires>?", (ad_id, now_ts())).rowcount == 1
+
+
+def claim_ad(ad_id, uid):
+    # Reserve BEFORE sending. A crash or ambiguous network error must not lead to
+    # a duplicate advert; a reserved/failed delivery is not retried automatically.
+    with ads_db() as db:
+        return db.execute("""INSERT OR IGNORE INTO ad_delivery(ad_id,uid,status)
+            SELECT id, ?, 'reserved' FROM ads WHERE id=? AND closed=0 AND expires>?""",
+                          (uid, ad_id, now_ts())).rowcount == 1
+
+
+def finish_ad(ad_id, uid, status):
+    with ads_db() as db:
+        db.execute("UPDATE ad_delivery SET status=? WHERE ad_id=? AND uid=?", (status, ad_id, uid))
+
+
+async def deliver_once(bot, uid, draft):
+    if uid in read_ids(OPTOUT_FILE):
+        return "optout"
+    if draft["expires"] and not claim_ad(draft["nonce"], uid):
+        return "skipped"
+    try:
+        await send_announcement(bot, uid, draft)
+    except TelegramError as exc:
+        if draft["expires"]:
+            finish_ad(draft["nonce"], uid, "failed")
+        print("Ad delivery error:", type(exc).__name__, flush=True)
+        return "failed"
+    if draft["expires"]:
+        finish_ad(draft["nonce"], uid, "sent")
+    return "sent"
+
+
+async def deliver_active_ads(bot, uid):
+    if uid in read_ids(OPTOUT_FILE):
+        return
+    for row in list_active_ads():
+        draft = dict(row)
+        draft["nonce"] = draft["id"]
+        draft["entities"] = tuple(MessageEntity.de_json(e, bot) for e in json.loads(draft["entities"]))
+        status = await deliver_once(bot, uid, draft)
+        if status in ("sent", "failed"):
+            await asyncio.sleep(1.1)
+
+
+async def activeads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    ads = list_active_ads()
+    if not ads:
+        await update.message.reply_text("Активных объявлений нет.")
+        return
+    await update.message.reply_text(f"📢 Активных объявлений: {len(ads)}. Закрытие прекращает новые отправки, но не удаляет уже отправленные сообщения.")
+    for ad in ads:
+        title = ANNOUNCEMENT_COURSES.get(ad["course"], ("Общее объявление",))[0]
+        await update.message.reply_text(f"{title} — до {expiry_label(ad['expires'])} включительно\n\n{ad['text'][:350]}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Закрыть объявление", callback_data=f"adclose:ask:{ad['id']}")]]))
+
+
+async def closead_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_admin(update):
+        await query.answer("Доступ запрещён", show_alert=True)
+        return
+    _, action, ad_id = query.data.split(":")
+    await query.answer()
+    if action == "ask":
+        await query.edit_message_reply_markup(InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Закрыть", callback_data=f"adclose:yes:{ad_id}"),
+            InlineKeyboardButton("❌ Назад", callback_data=f"adclose:no:{ad_id}")]]))
+    elif action == "no":
+        await query.edit_message_reply_markup(InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Закрыть объявление", callback_data=f"adclose:ask:{ad_id}")]]))
+    else:
+        changed = close_ad(ad_id)
+        await query.edit_message_reply_markup(None)
+        await query.message.reply_text("✅ Объявление закрыто." if changed else "Объявление уже закрыто или срок истёк.")
+
+
 async def broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     draft = context.user_data["broadcast"]
     if draft["stage"] == "photo":
@@ -591,6 +741,14 @@ async def broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if draft["stage"] == "course":
         await update.message.reply_text("Выберите курс кнопками в предыдущем сообщении. Отмена: /cancelbroadcast")
+        return
+    if draft["stage"] == "expiry":
+        try:
+            draft["expires"] = parse_expiry(update.message.text)
+        except (ValueError, OverflowError):
+            await update.message.reply_text("Введите сегодняшнюю или будущую дату в формате ДД.ММ.ГГГГ либо 0 для разовой рассылки.")
+            return
+        await preview_broadcast(context, draft)
         return
     if draft["stage"] == "confirm":
         await update.message.reply_text("Подтвердите или отмените рассылку кнопками под просмотром.")
@@ -626,21 +784,29 @@ async def broadcast_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Курс не найден.", show_alert=True)
         return
     draft["course"] = course
+    draft["stage"] = "expiry"
     await query.answer()
+    await context.bot.send_message(ADMIN_CHAT_ID,
+        "📅 До какой даты показывать объявление новым пользователям?\n"
+        "Введите дату ДД.ММ.ГГГГ (включительно, по Ташкенту).\n"
+        "Или отправьте 0 — только разовая рассылка.\nОтмена: /cancelbroadcast")
+
+
+async def preview_broadcast(context, draft):
     # Preview is delivered using exactly the same method as the real announcement.
     await context.bot.send_message(ADMIN_CHAT_ID, "📋 Предварительный просмотр:")
     try:
         await send_announcement(context.bot, ADMIN_CHAT_ID, draft)
     except TelegramError as exc:
         print("Broadcast preview error:", type(exc).__name__)
-        await context.bot.send_message(ADMIN_CHAT_ID, "Не удалось показать объявление. Выберите курс повторно или начните заново: /sendall.")
+        await context.bot.send_message(ADMIN_CHAT_ID, "Не удалось показать объявление. Повторите ввод даты или начните заново: /sendall.")
         return
     ids = recipients()
     draft["recipients"] = ids
     draft["stage"] = "confirm"
     nonce = draft["nonce"]
     await context.bot.send_message(ADMIN_CHAT_ID,
-        f"Отправить объявление {len(ids)} получателям?\nДо подтверждения рассылка не начнётся.",
+        f"Отправить объявление всем подписанным пользователям (сейчас {len(ids)})?\nСрок: {expiry_label(draft['expires'])}\nДо подтверждения рассылка не начнётся.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Отправить", callback_data=f"bc:yes:{nonce}"),
              InlineKeyboardButton("❌ Отменить", callback_data=f"bc:no:{nonce}")],
@@ -673,9 +839,21 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         await query.edit_message_text("❌ Рассылка отменена.")
         return
-    if not draft["recipients"]:
+    if draft["expires"] and draft["expires"] <= now_ts():
+        await query.answer("Срок уже истёк. Создайте новую рассылку.", show_alert=True)
+        return
+    draft["recipients"] = recipients()
+    if not draft["recipients"] and not draft["expires"]:
         await query.answer("База получателей пуста.", show_alert=True)
         return
+    # Publish only after explicit confirmation. Preview/test never publishes.
+    if draft["expires"]:
+        try:
+            publish_ad(draft)
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            print("Ad publish error:", type(exc).__name__, flush=True)
+            await query.answer("Не удалось сохранить объявление. Рассылка не началась.", show_alert=True)
+            return
     # Consume confirmation before any network await: a double click cannot start twice.
     context.user_data.pop("broadcast", None)
     context.bot_data["broadcast_running"] = True
@@ -685,27 +863,29 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def run_broadcast(bot, bot_data, draft):
-    success = failed = skipped = 0
+    success = failed = skipped = optout = 0
     try:
         for uid in draft["recipients"]:
-            if uid in read_ids(OPTOUT_FILE):
-                skipped += 1
-                continue
-            try:
-                await send_announcement(bot, uid, draft)
+            status = await deliver_once(bot, uid, draft)
+            if status == "sent":
                 success += 1
-            except TelegramError as exc:
+            elif status == "failed":
                 failed += 1
-                print("Broadcast delivery error:", type(exc).__name__)
+            elif status == "optout":
+                optout += 1
+            else:
+                skipped += 1
             await asyncio.sleep(0.15)
     finally:
         bot_data["broadcast_running"] = False
-        remaining = len(draft["recipients"]) - success - failed - skipped
+        remaining = len(draft["recipients"]) - success - failed - skipped - optout
         await bot.send_message(ADMIN_CHAT_ID,
             f"📊 Отчёт о рассылке\n\n✅ Отправлено полностью: {success}\n"
             f"⚠️ Ошибка / возможна частичная доставка: {failed}\n"
-            f"🔕 Отписались: {skipped}\n⏳ Не обработано: {remaining}\n"
-            f"Всего в подтверждённом списке: {len(draft['recipients'])}")
+            f"🔕 Отписались: {optout}\n⏭ Уже обработано или объявление закрыто/истекло: {skipped}\n"
+            f"⏳ Не обработано: {remaining}\n"
+            f"Всего в подтверждённом списке: {len(draft['recipients'])}"
+            + (f"\n📅 Активно до {expiry_label(draft['expires'])} включительно. Управление: /activeads" if draft["expires"] else ""))
 
 
 async def usersbackup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -751,12 +931,16 @@ for path in (USERS_FILE, OPTOUT_FILE):
         with open(path, "a", encoding="utf-8"):
             pass
 
+init_ads()
+
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(TypeHandler(Update, track_user), group=-1)
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("stats", stats))
 app.add_handler(CommandHandler("sendall", sendall))
+app.add_handler(CommandHandler("activeads", activeads))
+app.add_handler(CallbackQueryHandler(closead_callback, pattern=r"^adclose:(ask|yes|no):[0-9a-f]{16}$"))
 app.add_handler(CommandHandler("cancelbroadcast", cancelbroadcast))
 app.add_handler(CommandHandler("usersbackup", usersbackup))
 app.add_handler(CommandHandler("restoreusers", restoreusers))
