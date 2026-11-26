@@ -69,6 +69,8 @@ waiting_for_contact = set()
 
 selected_course = {}
 user_name = {}
+lead_source = {}
+preview_sources = {}
 
 HAMSHIRALIK_TEXT = """🩺 Hamshiralik kursi
 
@@ -134,6 +136,7 @@ def reset_user_state(user_id: int):
     waiting_for_contact.discard(user_id)
     selected_course.pop(user_id, None)
     user_name.pop(user_id, None)
+    lead_source.pop(user_id, None)
 
 def write_ids(path, ids):
     # Single bot replica; atomic replacement prevents a partially written list.
@@ -228,7 +231,8 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎂 Yoshi: {age}\n"
             f"🆔 Username: {username}\n"
             f"📚 Kurs: {course}\n"
-            f"📞 Telefon: {phone}"
+            f"📞 Telefon: {phone}\n\n"
+            + lead_source_text(user_id)
         )
 
         await context.bot.send_message(
@@ -296,34 +300,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if text == "📚 Kurslar":
+        reset_user_state(user_id)
+        context.user_data.pop("age", None)
         await update.message.reply_text(
             "Kerakli kursni tanlang:",
             reply_markup=courses_reply_markup
         )
 
     elif text == "🩺 Hamshiralik":
-        selected_course[user_id] = "Hamshiralik"
+        choose_course(user_id, "ham")
+        context.user_data.pop("age", None)
         await update.message.reply_text(
             HAMSHIRALIK_TEXT,
             reply_markup=course_action_reply_markup
         )
 
     elif text == "💆‍♀️ Massaj":
-        selected_course[user_id] = "Massaj"
+        choose_course(user_id, "mas")
+        context.user_data.pop("age", None)
         await update.message.reply_text(
             MASSAJ_TEXT,
             reply_markup=course_action_reply_markup
         )
 
     elif text == "🩸 Hijoma":
-        selected_course[user_id] = "Hijoma"
+        choose_course(user_id, "hij")
+        context.user_data.pop("age", None)
         await update.message.reply_text(
             HIJOMA_TEXT,
             reply_markup=course_action_reply_markup
         )
 
     elif text == "🦴 Vertebrologiya":
-        selected_course[user_id] = "Vertebrologiya"
+        choose_course(user_id, "ver")
+        context.user_data.pop("age", None)
         await update.message.reply_text(
             VERTEBROLOGIYA_TEXT,
             reply_markup=course_action_reply_markup
@@ -355,6 +365,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        waiting_for_age.discard(user_id)
+        waiting_for_contact.discard(user_id)
+        user_name.pop(user_id, None)
+        context.user_data.pop("age", None)
         waiting_for_name.add(user_id)
 
         await update.message.reply_text(
@@ -602,13 +616,67 @@ ANNOUNCEMENT_COURSES = {
 }
 
 
-def announcement_markup(course):
+def choose_course(uid, course):
+    source = lead_source.get(uid)
+    reset_user_state(uid)
+    selected_course[uid] = ANNOUNCEMENT_COURSES[course][0]
+    if source and source["course"] in ("all", course):
+        lead_source[uid] = source
+
+
+def short_ad_text(value, limit=350):
+    value = " ".join((value or "").split())
+    return value if len(value) <= limit else value[:limit-1] + "…"
+
+
+def lead_source_text(uid):
+    source = lead_source.get(uid)
+    if not source:
+        return "📍 Manba: Bot menyusi"
+    kind = source["kind"]
+    lines = ["📢 Manba: Reklama" if kind != "test" else "🧪 Manba: Test reklama (sinov)"]
+    if source.get("id"):
+        lines.append(f"🆔 Reklama ID: {source['id']}")
+    elif kind == "legacy":
+        lines.append("ℹ️ Eski e’lon: aniq ID mavjud emas")
+    if source.get("label"):
+        lines.append(f"🏷 Guruh / e’lon: {source['label']}")
+    if source.get("text"):
+        lines.append(f"📝 E’lon matni: {source['text']}")
+    if source.get("created"):
+        stamp = datetime.fromtimestamp(source["created"], TASHKENT).strftime("%d.%m.%Y %H:%M")
+        lines.append(f"📅 E’lon yaratilgan: {stamp}")
+    if kind == "unknown":
+        lines.append("ℹ️ E’lon ma’lumotlari topilmadi")
+    return "\n".join(lines)
+
+
+def announcement_markup(course, ad_id=None):
+    suffix = f":{ad_id}" if ad_id else ""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📝 Ro‘yxatdan o‘tish", callback_data=f"ad:join:{course}")],
+        [InlineKeyboardButton("📝 Ro‘yxatdan o‘tish", callback_data=f"ad:join:{course}{suffix}")],
         [InlineKeyboardButton("📚 Kurs haqida batafsil" if course != "all" else "📚 Kurslar",
-                              callback_data=f"ad:info:{course}")],
+                              callback_data=f"ad:info:{course}{suffix}")],
         [InlineKeyboardButton("🏠 Asosiy menyu", callback_data="ad:home:all")],
     ])
+
+
+def source_from_ad(query, course, ad_id):
+    msg = query.message
+    snippet = short_ad_text(getattr(msg, "caption", None) or getattr(msg, "text", None))
+    source = {"course": course, "text": snippet, "kind": "legacy"}
+    if ad_id and ad_id.startswith("test-"):
+        source.update(kind="test", id=ad_id[5:])
+        snapshot = preview_sources.get(ad_id)
+        if snapshot and snapshot["course"] == course:
+            source.update(label=snapshot["label"], text=snapshot["text"])
+    elif ad_id:
+        source.update(kind="unknown", id=ad_id)
+        with ads_db() as db:
+            ad = db.execute("SELECT * FROM ads WHERE id=? AND course=?", (ad_id, course)).fetchone()
+        if ad:
+            source.update(kind="ad", text=short_ad_text(ad["text"]), label=ad["label"], created=ad["created"])
+    return source
 
 
 async def announcement_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -620,15 +688,21 @@ async def announcement_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     if is_admin(update) and context.user_data.get("broadcast"):
         await query.answer("Сначала завершите или отмените черновик рассылки.", show_alert=True)
         return
-    _, action, course = query.data.split(":")
+    _, action, course, *extra = query.data.split(":")
+    ad_id = extra[0] if extra else None
     if action != "home" and course != "all" and course not in ANNOUNCEMENT_COURSES:
         await query.answer("Kurs topilmadi.", show_alert=True)
+        return
+    if ad_id and ad_id.startswith("test-") and not is_admin(update):
+        await query.answer("Faqat administrator uchun.", show_alert=True)
         return
     await query.answer()
     uid = chat.id
     # Navigation intentionally starts a fresh registration instead of mixing two courses.
     reset_user_state(uid)
     context.user_data.pop("age", None)
+    if action != "home":
+        lead_source[uid] = source_from_ad(query, course, ad_id)
     if action == "home":
         await context.bot.send_message(uid, "Asosiy menyu:", reply_markup=main_reply_markup)
     elif course == "all":
@@ -644,10 +718,16 @@ async def announcement_action(update: Update, context: ContextTypes.DEFAULT_TYPE
             await context.bot.send_message(uid, description, reply_markup=course_action_reply_markup)
 
 
-async def send_announcement(bot, chat_id, draft):
+async def send_announcement(bot, chat_id, draft, *, preview=False):
     text = draft["text"]
     entities = draft["entities"]
-    markup = announcement_markup(draft["course"])
+    ad_id = draft["nonce"]
+    if preview:
+        ad_id = "test-" + ad_id
+        preview_sources[ad_id] = {"course": draft["course"], "label": draft.get("label", ""), "text": short_ad_text(text)}
+        if len(preview_sources) > 20:
+            preview_sources.pop(next(iter(preview_sources)))
+    markup = announcement_markup(draft["course"], ad_id)
     kind = draft.get("media_type", "photo")  # old announcements remain photos
     if kind == "text":
         await send_with_retry(bot.send_message, chat_id=chat_id, text=text,
@@ -690,7 +770,8 @@ def init_ads():
             id TEXT PRIMARY KEY, photo TEXT NOT NULL, text TEXT NOT NULL,
             entities TEXT NOT NULL, course TEXT NOT NULL, expires INTEGER NOT NULL,
             closed INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL,
-            media_type TEXT NOT NULL DEFAULT 'photo'
+            media_type TEXT NOT NULL DEFAULT 'photo',
+            label TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS ad_delivery (
             ad_id TEXT NOT NULL, uid INTEGER NOT NULL, status TEXT NOT NULL,
@@ -700,6 +781,8 @@ def init_ads():
         # In-place additive migration: preserves all existing ads and delivery history.
         if "media_type" not in {row["name"] for row in db.execute("PRAGMA table_info(ads)")}:
             db.execute("ALTER TABLE ads ADD COLUMN media_type TEXT NOT NULL DEFAULT 'photo'")
+        if "label" not in {row["name"] for row in db.execute("PRAGMA table_info(ads)")}:
+            db.execute("ALTER TABLE ads ADD COLUMN label TEXT NOT NULL DEFAULT ''")
 
 
 def now_ts():
@@ -722,10 +805,10 @@ def expiry_label(expires):
 
 def publish_ad(draft):
     with ads_db() as db:
-        db.execute("INSERT INTO ads(id,photo,text,entities,course,expires,created,media_type) VALUES(?,?,?,?,?,?,?,?)",
+        db.execute("INSERT INTO ads(id,photo,text,entities,course,expires,created,media_type,label) VALUES(?,?,?,?,?,?,?,?,?)",
                    (draft["nonce"], draft["photo"], draft["text"],
                     json.dumps([e.to_dict() for e in draft["entities"]], ensure_ascii=False),
-                    draft["course"], draft["expires"], now_ts(), draft.get("media_type", "photo")))
+                    draft["course"], draft["expires"], now_ts(), draft.get("media_type", "photo"), draft.get("label", "")))
 
 
 def list_active_ads():
@@ -792,7 +875,7 @@ async def activeads(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for ad in ads:
         title = ANNOUNCEMENT_COURSES.get(ad["course"], ("Общее объявление",))[0]
         kind = {"photo": "🖼 Фото", "video": "🎬 Видео", "text": "📝 Текст"}.get(ad["media_type"], "Объявление")
-        await update.message.reply_text(f"{kind} · {title} — до {expiry_label(ad['expires'])} включительно\n\n{ad['text'][:350] or 'Без текста'}",
+        await update.message.reply_text(f"{kind} · {title} — до {expiry_label(ad['expires'])} включительно\nID: {ad['id']}\nГруппа: {ad['label'] or 'не указана'}\n\n{ad['text'][:350] or 'Без текста'}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Закрыть объявление", callback_data=f"adclose:ask:{ad['id']}")]]))
 
 
@@ -825,6 +908,15 @@ async def broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if draft["stage"] == "course":
         await update.message.reply_text("Выберите курс кнопками в предыдущем сообщении. Отмена: /cancelbroadcast")
+        return
+    if draft["stage"] == "label":
+        label = update.message.text.strip()
+        if not label or utf16_length(label) > 120:
+            await update.message.reply_text("Введите название группы до 120 символов или 0, чтобы пропустить.")
+            return
+        draft["label"] = "" if label == "0" else label
+        draft["stage"] = "expiry"
+        await update.message.reply_text("📅 До какой даты показывать объявление новым пользователям?\nВведите дату ДД.ММ.ГГГГ (включительно, по Ташкенту).\nИли 0 — разовая рассылка.\nОтмена: /cancelbroadcast")
         return
     if draft["stage"] == "expiry":
         try:
@@ -874,19 +966,19 @@ async def broadcast_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Курс не найден.", show_alert=True)
         return
     draft["course"] = course
-    draft["stage"] = "expiry"
+    draft["stage"] = "label"
     await query.answer()
     await context.bot.send_message(ADMIN_CHAT_ID,
-        "📅 До какой даты показывать объявление новым пользователям?\n"
-        "Введите дату ДД.ММ.ГГГГ (включительно, по Ташкенту).\n"
-        "Или отправьте 0 — только разовая рассылка.\nОтмена: /cancelbroadcast")
+        "🏷 Укажите название группы для администратора (например: Hamshiralik, 17:00, 1-dekabr).\n"
+        "Клиентам оно отдельно не показывается; будет в заявке.\n"
+        "Отправьте 0, чтобы пропустить. Отмена: /cancelbroadcast")
 
 
 async def preview_broadcast(context, draft):
     # Preview is delivered using exactly the same method as the real announcement.
     await context.bot.send_message(ADMIN_CHAT_ID, "📋 Предварительный просмотр:")
     try:
-        await send_announcement(context.bot, ADMIN_CHAT_ID, draft)
+        await send_announcement(context.bot, ADMIN_CHAT_ID, draft, preview=True)
     except TelegramError as exc:
         print("Broadcast preview error:", type(exc).__name__)
         await context.bot.send_message(ADMIN_CHAT_ID, "Не удалось показать объявление. Повторите ввод даты или начните заново: /sendall.")
@@ -896,7 +988,7 @@ async def preview_broadcast(context, draft):
     draft["stage"] = "confirm"
     nonce = draft["nonce"]
     await context.bot.send_message(ADMIN_CHAT_ID,
-        f"Отправить объявление всем подписанным пользователям (сейчас {len(ids)})?\nСрок: {expiry_label(draft['expires'])}\nДо подтверждения рассылка не начнётся.",
+        f"Отправить объявление всем подписанным пользователям (сейчас {len(ids)})?\nГруппа: {draft.get('label') or 'не указана'}\nID: {draft['nonce']}\nСрок: {expiry_label(draft['expires'])}\nДо подтверждения рассылка не начнётся.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Отправить", callback_data=f"bc:yes:{nonce}"),
              InlineKeyboardButton("❌ Отменить", callback_data=f"bc:no:{nonce}")],
@@ -920,7 +1012,7 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "test":
         await query.answer("Тест только администратору")
         try:
-            await send_announcement(context.bot, ADMIN_CHAT_ID, draft)
+            await send_announcement(context.bot, ADMIN_CHAT_ID, draft, preview=True)
         except TelegramError:
             await context.bot.send_message(ADMIN_CHAT_ID, "Ошибка тестовой отправки.")
         return
@@ -937,13 +1029,12 @@ async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("База получателей пуста.", show_alert=True)
         return
     # Publish only after explicit confirmation. Preview/test never publishes.
-    if draft["expires"]:
-        try:
-            publish_ad(draft)
-        except (sqlite3.Error, ValueError, TypeError) as exc:
-            print("Ad publish error:", type(exc).__name__, flush=True)
-            await query.answer("Не удалось сохранить объявление. Рассылка не началась.", show_alert=True)
-            return
+    try:
+        publish_ad(draft)
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        print("Ad publish error:", type(exc).__name__, flush=True)
+        await query.answer("Не удалось сохранить объявление. Рассылка не началась.", show_alert=True)
+        return
     # Consume confirmation before any network await: a double click cannot start twice.
     context.user_data.pop("broadcast", None)
     context.bot_data["broadcast_running"] = True
@@ -970,7 +1061,7 @@ async def run_broadcast(bot, bot_data, draft):
         bot_data["broadcast_running"] = False
         remaining = len(draft["recipients"]) - success - failed - skipped - optout
         await bot.send_message(ADMIN_CHAT_ID,
-            f"📊 Отчёт о рассылке\n\n✅ Отправлено полностью: {success}\n"
+            f"📊 Отчёт о рассылке\nID: {draft['nonce']}\nГруппа: {draft.get('label') or 'не указана'}\n\n✅ Отправлено полностью: {success}\n"
             f"⚠️ Ошибка / возможна частичная доставка: {failed}\n"
             f"🔕 Отписались: {optout}\n⏭ Уже обработано или объявление закрыто/истекло: {skipped}\n"
             f"⏳ Не обработано: {remaining}\n"
@@ -1039,7 +1130,7 @@ app.add_handler(CommandHandler("startads", startads))
 app.add_handler(CallbackQueryHandler(broadcast_confirm, pattern=r"^bc:(yes|no|test):[0-9a-f]{16}$"))
 app.add_handler(CallbackQueryHandler(broadcast_format, pattern=r"^bformat:(pt|vt|p|v|t|cancel):[0-9a-f]{16}$"))
 app.add_handler(CallbackQueryHandler(broadcast_course, pattern=r"^bcourse:(ham|mas|hij|ver|all):[0-9a-f]{16}$"))
-app.add_handler(CallbackQueryHandler(announcement_action, pattern=r"^ad:(join|info|home):(ham|mas|hij|ver|all)$"))
+app.add_handler(CallbackQueryHandler(announcement_action, pattern=r"^ad:(join|info|home):(ham|mas|hij|ver|all)(?::(?:[0-9a-f]{16}|test-[0-9a-f]{16}))?$"))
 app.add_handler(MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.VIDEO_NOTE | filters.ANIMATION) & filters.ChatType.PRIVATE, broadcast_media))
 app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
